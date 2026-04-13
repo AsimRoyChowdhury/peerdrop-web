@@ -1,65 +1,155 @@
-import Image from "next/image";
+'use client';
+
+import { useState, useRef } from 'react';
+
+// 1. Define the exact structure of our Matchmaker's messages
+interface SignalData {
+  type: 'joined' | 'error' | 'offer' | 'ice_candidate';
+  room?: string;
+  message?: string;
+  sdp?: string; // Changed from 'any' to the strict WebRTC type
+  candidate?: RTCIceCandidateInit;
+}
 
 export default function Home() {
+  const [roomId, setRoomId] = useState<string>('');
+  const [status, setStatus] = useState<string>('Enter the 4-digit code from the terminal');
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+  
+  // 2. Strongly type our mutable references
+  const wsRef = useRef<WebSocket | null>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const receiveBuffer = useRef<ArrayBuffer[]>([]);
+
+  const connectAndJoin = () => {
+    setStatus('Connecting to Matchmaker...');
+    
+    const ws = new WebSocket('wss://peerdrop-server.onrender.com');
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: 'join', room: roomId }));
+    };
+
+    ws.onmessage = async (message: MessageEvent) => {
+      const data: SignalData = JSON.parse(message.data);
+
+      if (data.type === 'joined') {
+        setStatus('Joined room! Waiting for PC to send file...');
+        setupWebRTC();
+      } 
+      else if (data.type === 'error') {
+        setStatus(`Error: ${data.message}`);
+      }
+      else if (data.type === 'offer' && data.sdp) {
+        setStatus('Received connection offer. Securing tunnel...');
+        
+        if (!pcRef.current) return;
+
+        // THE FIX: Explicitly construct the object WebRTC expects
+        await pcRef.current.setRemoteDescription(new RTCSessionDescription({
+          type: 'offer',
+          sdp: data.sdp
+        }));
+        
+        const answer = await pcRef.current.createAnswer();
+        await pcRef.current.setLocalDescription(answer);
+        
+        ws.send(JSON.stringify({ type: 'answer', room: roomId, sdp: answer.sdp }));
+      }
+      else if (data.type === 'ice_candidate' && data.candidate) {
+        if (!pcRef.current) return;
+        await pcRef.current.addIceCandidate(new RTCIceCandidate(data.candidate));
+      }
+    };
+  };
+
+  const setupWebRTC = () => {
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+    pcRef.current = pc;
+
+    pc.onicecandidate = (event: RTCPeerConnectionIceEvent) => {
+      if (event.candidate && wsRef.current) {
+        wsRef.current.send(JSON.stringify({
+          type: 'ice_candidate',
+          room: roomId,
+          candidate: event.candidate
+        }));
+      }
+    };
+
+    pc.ondatachannel = (event: RTCDataChannelEvent) => {
+      const receiveChannel = event.channel;
+      receiveChannel.binaryType = 'arraybuffer'; 
+      
+      setStatus('Receiving file chunks...');
+
+      receiveChannel.onmessage = (e: MessageEvent) => {
+        // e.data is now strictly treated as an ArrayBuffer
+        receiveBuffer.current.push(e.data as ArrayBuffer);
+      };
+
+      receiveChannel.onclose = () => {
+        setStatus('Transfer Complete! Formatting file...');
+        
+        const blob = new Blob(receiveBuffer.current);
+        const url = URL.createObjectURL(blob);
+        setDownloadUrl(url);
+        setStatus('Ready to download.');
+        
+        if (wsRef.current) {
+          wsRef.current.close();
+        }
+      };
+    };
+  };
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
+    <main className="flex min-h-screen flex-col items-center justify-center bg-gray-900 text-white p-6">
+      <div className="max-w-md w-full bg-gray-800 rounded-xl shadow-2xl p-8 space-y-6 text-center">
+        
+        <h1 className="text-4xl font-bold tracking-tight text-blue-400">PeerDrop</h1>
+        <p className="text-gray-400 text-sm">Zero-Install P2P File Transfer</p>
+
+        <div className="space-y-4 pt-4">
+          <input
+            type="text"
+            maxLength={4}
+            placeholder="0000"
+            className="w-full bg-gray-700 text-white text-center text-3xl tracking-[0.5em] rounded-lg py-4 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            value={roomId}
+            onChange={(e) => setRoomId(e.target.value.replace(/\D/g, ''))} 
+          />
+          
+          <button 
+            onClick={connectAndJoin}
+            disabled={roomId.length !== 4}
+            className="w-full bg-blue-600 hover:bg-blue-500 disabled:bg-gray-600 disabled:cursor-not-allowed transition-colors py-3 rounded-lg font-semibold text-lg"
+          >
+            Connect
+          </button>
+        </div>
+
+        <div className="pt-6 border-t border-gray-700">
+          <p className="text-sm text-yellow-400 font-mono animate-pulse">
+            {status}
           </p>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+
+        {downloadUrl && (
+          <div className="pt-4 animate-bounce">
+            <a 
+              href={downloadUrl} 
+              download="peerdrop_received_file" 
+              className="inline-block bg-green-500 hover:bg-green-400 text-white font-bold py-3 px-8 rounded-full shadow-lg transition-transform"
+            >
+              ⬇️ Save File
+            </a>
+          </div>
+        )}
+      </div>
+    </main>
   );
 }
